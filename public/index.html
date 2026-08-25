@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgriPath - Regulatory Pathway Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    .card { background-color: #1e293b; border: 1px solid #334155; color: #f8fafc; }
+    .table-dark { background-color: #1e293b; color: #cbd5e1; }
+    .badge-db { background-color: #10b981; color: #000; font-weight: bold; }
+    .badge-ai { background-color: #d946ef; color: #fff; font-weight: bold; }
+  </style>
+</head>
+<body class="p-4">
+  <div class="container" style="max-width: 900px;">
+    
+    <!-- Header -->
+    <div class="text-center mb-4">
+      <h1 class="text-success fw-bold">🌱 AgriPath Regulatory System</h1>
+      <p class="text-secondary">Sub-Second Agroclimatic & Regulatory Caching Dashboard</p>
+    </div>
+
+    <!-- Input Form -->
+    <div class="card p-4 mb-4 shadow">
+      <div class="row g-3">
+        <div class="col-md-5">
+          <label class="form-label text-light fw-bold">Target Country</label>
+          <input type="text" id="countryInput" class="form-control bg-dark text-light border-secondary" value="Chile">
+        </div>
+        <div class="col-md-5">
+          <label class="form-label text-light fw-bold">Technology Type</label>
+          <select id="techInput" class="form-select bg-dark text-light border-secondary">
+            <option value="seeds_varieties" >🌱 Seeds & Varieties</option>
+            <option value="biological_inputs">🧪 Biological Inputs</option>
+            <option value="fertilizers_crop_protection">🧪 Fertilizers & Crop Protection</option>
+            <option value="irrigation_water_management">💧 Irrigation & Water Management</option>
+            <option value="farm_machinery_equipment">⚙️ Farm Machinery & Equipment</option>
+            <option value="solar_clean_energy">☀️ Solar & Clean Energy</option>
+            <option value="digital_precision_agriculture">📡 Digital & Precision Agriculture</option>
+            <option value="livestock_animal_health">🐄 Livestock & Animal Health</option>
+            <option value="aquaculture_fisheries">🐟 Aquaculture & Fisheries</option>
+            <option value="storage_post_harvest">📦 Storage & Post-Harvest</option>
+            <option value="agrifinance_insurtech">💳 AgriFinance & InsurTech</option>
+            <option value="novel_biotech">🧬 Novel / Biotech</option>
+          </select>
+        </div>
+        <div class="col-md-2 d-flex align-items-end">
+          <button onclick="fetchRegulatoryData()" class="btn btn-success w-100 fw-bold">Search</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Loader / Progress -->
+    <div id="loader" class="text-center my-4 d-none">
+      <div class="spinner-border text-success mb-2" role="status"></div>
+      <p class="text-warning fw-bold" id="timerText">⏳ Fetching Regulatory Data... 0s elapsed</p>
+    </div>
+
+    <!-- Error Container -->
+    <div id="errorBox" class="alert alert-danger d-none my-3"></div>
+
+    <!-- Results Container -->
+    <div id="resultsView" class="d-none">
+      
+      <!-- Banner -->
+      <div class="card p-3 mb-4 d-flex flex-row justify-content-between align-items-center">
+        <div>
+          <span class="fs-5 fw-bold">Query Result Status: </span>
+          <span class="badge bg-success">SUCCESS</span>
+        </div>
+        <div>
+          <span id="sourceBadge" class="badge p-2"></span>
+          <span id="timeBadge" class="badge bg-warning text-dark p-2 ms-2 fw-bold"></span>
+        </div>
+      </div>
+
+      <!-- Overview Table -->
+      <div class="card p-3 mb-4">
+        <h5 class="text-info fw-bold mb-3">📌 Regulatory Overview</h5>
+        <table class="table table-dark table-striped align-middle">
+          <tbody>
+            <tr><td class="w-25 text-secondary">Target Country</td><td id="resCountry" class="fw-bold"></td></tr>
+            <tr><td class="text-secondary">Technology Type</td><td id="resTech" class="fw-bold"></td></tr>
+            <tr><td class="text-secondary">Regulatory Authority</td><td id="resAuthority" class="text-warning fw-bold"></td></tr>
+            <tr><td class="text-secondary">Est. Timeline</td><td id="resTimeline"></td></tr>
+            <tr><td class="text-secondary">Est. Cost (USD)</td><td id="resCost" class="text-success fw-bold"></td></tr>
+            <tr><td class="text-secondary">Confidence Score</td><td id="resScore" class="text-info"></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Workflow Steps Table -->
+      <div class="card p-3 mb-4">
+        <h5 class="text-info fw-bold mb-3">🔄 Approval Workflow</h5>
+        <table class="table table-dark table-bordered align-middle">
+          <thead>
+            <tr class="text-info">
+              <th style="width: 15%;">Step #</th>
+              <th>Action Plan</th>
+            </tr>
+          </thead>
+          <tbody id="workflowBody"></tbody>
+        </table>
+      </div>
+
+      <!-- Compliance Table -->
+      <div class="card p-3 mb-4">
+        <h5 class="text-info fw-bold mb-3">📋 Compliance & Documents</h5>
+        <table class="table table-dark table-bordered">
+          <thead>
+            <tr class="text-info">
+              <th>Required Documents</th>
+              <th>HS Customs Codes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td id="resDocs"></td>
+              <td id="resHS" class="text-warning fw-bold"></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+    </div>
+
+  </div>
+
+  <script>
+    let timerInterval;
+
+    async function fetchRegulatoryData() {
+      const country = document.getElementById('countryInput').value.trim();
+      const techType = document.getElementById('techInput').value.trim();
+
+      if (!country || !techType) return alert('Please enter both country and technology type');
+
+      // Reset UI
+      document.getElementById('resultsView').classList.add('d-none');
+      document.getElementById('errorBox').classList.add('d-none');
+      document.getElementById('loader').classList.remove('d-none');
+
+      let seconds = 0;
+      document.getElementById('timerText').innerText = `⏳ Fetching Regulatory Data... 0s elapsed`;
+      
+      clearInterval(timerInterval);
+      timerInterval = setInterval(() => {
+        seconds += 1;
+        document.getElementById('timerText').innerText = `⏳ Fetching Regulatory Data... ${seconds}s elapsed`;
+      }, 1000);
+
+      try {
+        const res = await fetch('/api/regulatory', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ country, techType })
+        });
+
+        clearInterval(timerInterval);
+        document.getElementById('loader').classList.add('d-none');
+
+        const data = await res.json();
+
+        if (!data.success) {
+          document.getElementById('errorBox').innerText = `Error: ${data.error} (${data.details || ''})`;
+          document.getElementById('errorBox').classList.remove('d-none');
+          return;
+        }
+
+        // Populate Overview
+        document.getElementById('resCountry').innerText = data.summary.target_country;
+        document.getElementById('resTech').innerText = data.summary.technology_type;
+        document.getElementById('resAuthority').innerText = data.summary.regulatory_authority;
+        document.getElementById('resTimeline').innerText = data.summary.estimated_timeline;
+        document.getElementById('resCost').innerText = data.summary.estimated_cost;
+        document.getElementById('resScore').innerText = data.meta.confidence_score;
+
+        // Badges
+        const isDB = data.meta.source === 'database';
+        const badgeEl = document.getElementById('sourceBadge');
+        badgeEl.innerText = isDB ? 'SUPABASE DB' : 'OLLAMA AI GENERATED';
+        badgeEl.className = `badge p-2 ${isDB ? 'badge-db' : 'badge-ai'}`;
+
+        document.getElementById('timeBadge').innerText = `Time: ${data.meta.source === 'database' ? '< 1s' : 'AI Processing Finished'}`;
+
+        // Workflow Table
+        const wfBody = document.getElementById('workflowBody');
+        wfBody.innerHTML = '';
+        if (data.workflow && data.workflow.approval_process) {
+          data.workflow.approval_process.forEach(step => {
+            wfBody.innerHTML += `<tr><td class="fw-bold">Step ${step.step_number}</td><td>${step.action}</td></tr>`;
+          });
+        }
+
+        // Compliance
+        document.getElementById('resDocs').innerHTML = data.compliance_requirements.required_documents.map(d => `• ${d}`).join('<br>');
+        document.getElementById('resHS').innerText = data.compliance_requirements.hs_customs_codes.join(', ');
+
+        // Show Results
+        document.getElementById('resultsView').classList.remove('d-none');
+
+      } catch (err) {
+        clearInterval(timerInterval);
+        document.getElementById('loader').classList.add('d-none');
+        document.getElementById('errorBox').innerText = 'Network error: ' + err.message;
+        document.getElementById('errorBox').classList.remove('d-none');
+      }
+    }
+  </script>
+</body>
+</html>
