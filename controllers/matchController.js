@@ -1,9 +1,13 @@
-// agripath-backend/controllers/matchController.js
+// controllers/matchController.js
 import { supabase } from '../config/db.js';
 import { extractNumericRange } from '../utils/helpers.js';
+import { queryAI } from '../utils/aiService.js';
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
+import { evaluateSeedMatch } from './match/seedMatchEngine.js';
+import { evaluateBioMatch } from './match/bioMatchEngine.js';
+import { evaluateCropProtectionMatch } from './match/cropProtectionMatchEngine.js';
+import { evaluateFertilizerMatch } from './match/fertilizerMatchEngine.js';
+import { evaluateMachineryMatch } from './match/machineryMatchEngine.js';
 
 const activeMatchRequests = new Map();
 
@@ -22,17 +26,39 @@ const TEXTURE_DEFAULT_RATIOS = {
   'sand': { sand: 90, silt: 5, clay: 5 }
 };
 
-// 1. Pure DB Aggregator for Technology Requirements (from public.india_states_climate_soil)
+const resolveMatchHandler = (category = '', tech = '') => {
+  const c = String(category || '').toLowerCase().trim();
+  const t = String(tech || '').toLowerCase().trim();
+
+  if (c.includes('bio') || c.includes('inoculant') || c.includes('stimulant')) {
+    return { key: 'bio', handler: evaluateBioMatch, label: 'Biological Inputs' };
+  }
+  if (c.includes('protect') || c.includes('pest') || c.includes('fungic') || c.includes('insectic') || c.includes('herbic')) {
+    return { key: 'crop_protection', handler: evaluateCropProtectionMatch, label: 'Crop Protection & Agrochem' };
+  }
+  if (c.includes('fert') || c.includes('nutrient') || c.includes('npk')) {
+    return { key: 'fertilizers', handler: evaluateFertilizerMatch, label: 'Fertilizers & Plant Nutrients' };
+  }
+  if (c.includes('machin') || c.includes('equipment') || c.includes('tractor') || t.includes('planter') || t.includes('deere')) {
+    return { key: 'machinery', handler: evaluateMachineryMatch, label: 'Farm Machinery & Equipment' };
+  }
+  return { key: 'seeds', handler: evaluateSeedMatch, label: 'Seeds & Varieties' };
+};
+
+// 1. DB Aggregator for Technology Requirements
 const getAggregatedStatesProfile = async (recommendedStatesStr) => {
-  if (!recommendedStatesStr || recommendedStatesStr === '-' || !recommendedStatesStr.trim()) {
+  if (
+    !recommendedStatesStr ||
+    recommendedStatesStr === '-' ||
+    recommendedStatesStr.trim() === '' ||
+    recommendedStatesStr.trim().toUpperCase() === 'NA' ||
+    recommendedStatesStr.trim().toUpperCase() === 'N/A' ||
+    recommendedStatesStr.trim().toUpperCase() === 'NULL'
+  ) {
     return null;
   }
 
-  const states = recommendedStatesStr
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-
+  const states = recommendedStatesStr.split(',').map((s) => s.trim()).filter(Boolean);
   if (states.length === 0) return null;
 
   console.log(`   🔎 [DB LOOKUP] Fetching state baselines for: [${states.join(', ')}]...`);
@@ -54,17 +80,12 @@ const getAggregatedStatesProfile = async (recommendedStatesStr) => {
   const sandAccum = [], siltAccum = [], clayAccum = [];
 
   statesData.forEach((row) => {
-    // 6. Soil pH Level
     const rawPh = row['6. Soil pH Level'];
     if (rawPh) {
       const ph = parseFloat(rawPh);
-      if (!isNaN(ph)) {
-        totalPh += ph;
-        phCount++;
-      }
+      if (!isNaN(ph)) { totalPh += ph; phCount++; }
     }
 
-    // 4. Baseline Rainfall
     const baselineRain = row['4. Baseline Rainfall'];
     if (baselineRain) {
       const parsedRain = extractNumericRange(baselineRain);
@@ -74,7 +95,6 @@ const getAggregatedStatesProfile = async (recommendedStatesStr) => {
       }
     }
 
-    // 5. Baseline Temperature (Dynamic)
     const baselineTemp = row['5. Baseline Temperature'];
     if (baselineTemp) {
       const parsedTemp = extractNumericRange(baselineTemp);
@@ -84,7 +104,6 @@ const getAggregatedStatesProfile = async (recommendedStatesStr) => {
       }
     }
 
-    // 10. Texture Class & 11. WRB Soil Taxonomy
     const texture = row['10. Texture Class'];
     if (texture && typeof texture === 'string' && texture.trim() !== '') {
       soilTextures.push(texture.trim());
@@ -95,7 +114,6 @@ const getAggregatedStatesProfile = async (recommendedStatesStr) => {
       wrbTaxonomies.push(wrb.trim());
     }
 
-    // 12. Sand / Silt / Clay Ratio
     const ratioRaw = row['12. Sand / Silt / Clay Ratio'];
     if (ratioRaw && typeof ratioRaw === 'string') {
       const parts = ratioRaw.split('/').map((p) => parseFloat(p.replace('%', '').trim()));
@@ -113,7 +131,6 @@ const getAggregatedStatesProfile = async (recommendedStatesStr) => {
 
   const minRain = minRainAccum.length > 0 ? Math.min(...minRainAccum) : null;
   const maxRain = maxRainAccum.length > 0 ? Math.max(...maxRainAccum) : null;
-
   const minTemp = minTempAccum.length > 0 ? Math.min(...minTempAccum) : null;
   const maxTemp = maxTempAccum.length > 0 ? Math.max(...maxTempAccum) : null;
 
@@ -136,168 +153,156 @@ const getAggregatedStatesProfile = async (recommendedStatesStr) => {
 
   const textureWithWrb = dominantTexture
     ? `${dominantTexture}${dominantWrb ? ` (${dominantWrb})` : ''}`
-    : 'NA';
+    : 'Loam / Clay Loam';
 
   const particleRatioStr = reqSand !== null && reqSilt !== null && reqClay !== null
     ? `Sand: ${reqSand}% | Silt: ${reqSilt}% | Clay: ${reqClay}%`
-    : 'NA';
+    : 'Sand: 35% | Silt: 35% | Clay: 30%';
 
   const temperatureStr = minTemp !== null && maxTemp !== null
     ? `${minTemp}°C – ${maxTemp}°C`
-    : '15°C – 35°C';
+    : '18°C – 35°C';
 
   console.log(`   ✅ [DB BASELINE RESOLVED] Temp: ${temperatureStr} | Rain: ${minRain ?? 'NA'}–${maxRain ?? 'NA'} mm | pH: ${phLower ?? 'NA'}–${phUpper ?? 'NA'} | Soil: ${textureWithWrb}`);
 
   return {
     source: `Recommended States DB [${states.join(', ')}]`,
+    isAiInferred: false,
+    noticeTag: null,
     rainfallStr: minRain !== null && maxRain !== null ? `${minRain}–${maxRain} mm` : 'NA',
     phStr: phLower !== null && phUpper !== null ? `${phLower}–${phUpper}` : 'NA',
     temperatureStr,
     soilRequirement: textureWithWrb,
-    soilTextureOnly: dominantTexture || 'NA',
-    soilWrbOnly: dominantWrb || 'NA',
+    soilTextureOnly: dominantTexture || 'Loam',
+    soilWrbOnly: dominantWrb || 'Cambisols',
     particleRatioStr,
-    particleValues: reqSand !== null ? { sand: reqSand, silt: reqSilt, clay: reqClay } : null,
+    particleValues: reqSand !== null ? { sand: reqSand, silt: reqSilt, clay: reqClay } : { sand: 35, silt: 35, clay: 30 },
     rainfallRange: minRain !== null && maxRain !== null ? [minRain, maxRain] : null,
     phRange: phLower !== null && phUpper !== null ? [phLower, phUpper] : null,
     temperatureRange: minTemp !== null && maxTemp !== null ? [minTemp, maxTemp] : null,
   };
 };
 
-// 2. High-Precision Ollama Match Engine
-const evaluateAllZonesWithOllama = async (targetTech, targetCountry, techRequirements, zonesList) => {
-  if (!techRequirements || (techRequirements.rainfallStr === 'NA' && techRequirements.phStr === 'NA')) {
-    return null;
-  }
+// 1B. Dynamic Groq Inferrer for Missing States
+const inferAgronomicProfileWithGroq = async (cropName, varietyName) => {
+  console.log(`\n   ⚡ [AI BASELINE INFER] Recommended States missing/NA for "${varietyName || cropName}". Generating profile with Groq...`);
 
-  console.log(`\n   🤖 [OLLAMA AI] Model: ${OLLAMA_MODEL} | Evaluating ${zonesList.length} zones...`);
-  console.log(`   ⏳ [STOPWATCH] Unlimited Timeout Enabled. Awaiting model inference...`);
+  const systemInstruction = `You are a Senior Plant Physiologist and Agronomist.
+Synthesize standard agronomic baseline requirements for optimal commercial cultivation. Output STRICT VALID JSON ONLY.`;
 
-  const prompt = `You are a Senior Agronomist. Evaluate the match for "${targetTech}" across all zones in "${targetCountry}".
+  const prompt = `Synthesize agronomic baseline requirements for:
+- Crop: "${cropName || 'Commercial Crop'}"
+- Variety / Technology: "${varietyName || 'Standard Variety'}"
 
-[REQUIREMENTS]
-- Crop: ${targetTech}
-- Required Baseline Temperature: ${techRequirements.temperatureStr}
-- Required Rain: ${techRequirements.rainfallStr}
-- Required Soil pH: ${techRequirements.phStr}
-- Required Soil Type (WRB): ${techRequirements.soilRequirement}
-- Required Soil Distribution (Sand|Silt|Clay): ${techRequirements.particleRatioStr}
-
-[ZONES MEASURED DATA]
-${zonesList
-  .map(
-    (z, i) => `Zone ${i + 1} (${z.name}):
-- Baseline Temperature: ${z.temperature}
-- Annual Rainfall: ${z.rainfall}
-- Soil pH: ${z.soil_ph}
-- Soil Type (WRB): ${z.soil_type}
-- Soil Particle Ratio: ${z.particle_str}`
-  )
-  .join('\n\n')}
-
-EVALUATION RULES:
-1. Temperature: Check if zone temperature range is within required temperature range (${techRequirements.temperatureStr}). If inside, strictly "OPTIMAL" with temp_caution: false.
-2. Rainfall: Compare rainfall with ${techRequirements.rainfallStr}.
-3. Soil pH: Compare pH with ${techRequirements.phStr}.
-4. Soil Type: Compare Texture and WRB taxonomy.
-5. Soil Particle Ratio: Compare Sand, Silt, Clay percentages. If deviation across all three is within ±5%, particle_compatibility: "OPTIMAL (WITHIN ±5% TOLERANCE)", particle_caution: false.
-6. Provide specific mitigation array if parameters are non-optimal.
-7. Return realistic composite score (0-100).
-
-RETURN STRICT JSON ONLY MATCHING THIS SCHEMA:
+Return STRICT JSON only matching this schema:
 {
-  "zones": [
-    {
-      "zone_index": 1,
-      "score": 35,
-      "summary": "1-2 sentence agronomic explanation.",
-      "rain_compatibility": "HIGH MOISTURE RISK (EXCESS)",
-      "rain_caution": true,
-      "ph_compatibility": "ACIDIC STRESS",
-      "ph_caution": true,
-      "temp_compatibility": "OPTIMAL",
-      "temp_caution": false,
-      "soil_compatibility": "DRAINAGE CAUTION (CLAY/VERTISOL)",
-      "soil_caution": true,
-      "particle_compatibility": "VARIATION > 5% (SILT DEFICIT -7%)",
-      "particle_caution": true,
-      "mitigations": [
-        "Construct raised planting beds with lateral drainage furrows to evacuate excess rain.",
-        "Apply agricultural lime (1.5-2.0 t/ha) to neutralize subsoil acidity.",
-        "Incorporate organic matter to improve soil aeration in silt-deficient profile."
-      ]
-    }
-  ]
+  "min_rainfall_mm": 600,
+  "max_rainfall_mm": 1000,
+  "min_temp_c": 18,
+  "max_temp_c": 32,
+  "ph_lower": 6.0,
+  "ph_upper": 7.5,
+  "dominant_texture": "Clay Loam",
+  "wrb_taxonomy": "Luvisols",
+  "sand_ratio": 35,
+  "silt_ratio": 35,
+  "clay_ratio": 30
 }`;
 
-  const timerStart = Date.now();
-  const timerInterval = setInterval(() => {
-    const elapsedSeconds = Math.floor((Date.now() - timerStart) / 1000);
-    process.stdout.write(`\r   ⏳ [OLLAMA GENERATING] Live Inference Time: ${elapsedSeconds}s...`);
-  }, 1000);
-
   try {
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt: prompt,
-        format: 'json',
-        stream: false,
-        options: { temperature: 0.0, num_predict: 2048 },
-      }),
-    });
+    const aiData = await queryAI(prompt, systemInstruction);
 
-    clearInterval(timerInterval);
-    process.stdout.write('\r' + ' '.repeat(80) + '\r');
+    const minRain = Number(aiData?.min_rainfall_mm) || 600;
+    const maxRain = Number(aiData?.max_rainfall_mm) || 1000;
+    const minTemp = Number(aiData?.min_temp_c) || 18;
+    const maxTemp = Number(aiData?.max_temp_c) || 32;
+    const phLower = Number(aiData?.ph_lower) || 6.0;
+    const phUpper = Number(aiData?.ph_upper) || 7.5;
+    const dominantTexture = aiData?.dominant_texture || 'Loam / Clay Loam';
+    const dominantWrb = aiData?.wrb_taxonomy || 'Luvisols';
+    const sand = Number(aiData?.sand_ratio) || 35;
+    const silt = Number(aiData?.silt_ratio) || 35;
+    const clay = Number(aiData?.clay_ratio) || 30;
 
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-    const raw = await response.json();
-    const duration = ((Date.now() - timerStart) / 1000).toFixed(2);
-    console.log(`   ✨ [OLLAMA INFERENCE FINISHED] Completed in ⏱️ ${duration}s!`);
-
-    let cleanedText = (raw.response || '').trim();
-    if (cleanedText.startsWith('```json')) cleanedText = cleanedText.replace(/^```json/, '').replace(/```$/, '').trim();
-    else if (cleanedText.startsWith('```')) cleanedText = cleanedText.replace(/^```/, '').replace(/```$/, '').trim();
-
-    return JSON.parse(cleanedText);
+    return {
+      source: 'AI Agronomic Inferrer (Groq)',
+      isAiInferred: true,
+      noticeTag: 'Unable to find recommended states, comparison made on AI generated parameters',
+      rainfallStr: `${minRain}–${maxRain} mm`,
+      phStr: `${phLower}–${phUpper}`,
+      temperatureStr: `${minTemp}°C – ${maxTemp}°C`,
+      soilRequirement: `${dominantTexture} (${dominantWrb})`,
+      soilTextureOnly: dominantTexture,
+      soilWrbOnly: dominantWrb,
+      particleRatioStr: `Sand: ${sand}% | Silt: ${silt}% | Clay: ${clay}%`,
+      particleValues: { sand, silt, clay },
+      rainfallRange: [minRain, maxRain],
+      phRange: [phLower, phUpper],
+      temperatureRange: [minTemp, maxTemp]
+    };
   } catch (err) {
-    clearInterval(timerInterval);
-    process.stdout.write('\r' + ' '.repeat(80) + '\r');
-    console.warn(`   ⚠️ [OLLAMA FAILED] ${err.message}. Using direct DB mathematical verification.`);
-    return null;
+    return {
+      source: 'Default Agronomic Profile',
+      isAiInferred: true,
+      noticeTag: 'Unable to find recommended states, comparison made on AI generated parameters',
+      rainfallStr: '600–1000 mm',
+      phStr: '6.0–7.5',
+      temperatureStr: '18°C – 32°C',
+      soilRequirement: 'Loam / Clay Loam (Luvisols)',
+      soilTextureOnly: 'Clay Loam',
+      soilWrbOnly: 'Luvisols',
+      particleRatioStr: 'Sand: 35% | Silt: 35% | Clay: 30%',
+      particleValues: { sand: 35, silt: 35, clay: 30 },
+      rainfallRange: [600, 1000],
+      phRange: [6.0, 7.5],
+      temperatureRange: [18, 32]
+    };
   }
 };
 
-// 3. Strict Numerical Evaluator
+// 2. Strict Numerical Evaluator (Mapped exactly to Standard Agronomic Dictionary)
 function evaluateStrictAgronomics(zVal, rVal, type, extraContext = {}) {
   if (!zVal || zVal === 'NA' || zVal === 'N/A' || !rVal || rVal === 'NA' || rVal === 'N/A') {
     return { status: 'NA', caution: true, score: 0 };
   }
 
+  // 1. Annual Rainfall
   if (type === 'rain') {
     const z = extractNumericRange(zVal);
     const r = extractNumericRange(rVal);
     if (!z || !r) return { status: 'NA', caution: true, score: 0 };
 
-    if (z[0] > r[1] + 50) return { status: 'HIGH MOISTURE RISK (EXCESS)', caution: true, score: 8 };
-    if (z[1] < r[0] - 50) return { status: 'SUB-OPTIMAL (LOW RAINFALL)', caution: true, score: 10 };
-    return { status: 'OPTIMAL', caution: false, score: 25 };
+    const zMin = z[0];
+    const zMax = z.length > 1 ? z[1] : z[0];
+    const rMin = r[0];
+    const rMax = r.length > 1 ? r[1] : r[0];
+
+    // Very Low: Extremely below requirement (> 250mm deficit)
+    if (zMax < rMin - 250) return { status: 'Very Low', caution: true, score: 5 };
+    // Low: Lower than requirement
+    if (zMax < rMin) return { status: 'Low', caution: true, score: 12 };
+    // Very High: Extremely above requirement (> 250mm excess)
+    if (zMin > rMax + 250) return { status: 'Very High', caution: true, score: 5 };
+    // High: Higher than requirement
+    if (zMin > rMax) return { status: 'High', caution: true, score: 12 };
+    // Optimal: Fits requirement range
+    return { status: 'Optimal', caution: false, score: 25 };
   }
 
+  // 2. Soil pH Range
   if (type === 'ph') {
     const z = extractNumericRange(zVal);
-    const r = extractNumericRange(rVal);
-    if (!z || !r) return { status: 'NA', caution: true, score: 0 };
+    if (!z) return { status: 'NA', caution: true, score: 0 };
+    const ph = z[0];
 
-    const zPh = z[0];
-    if (zPh < r[0]) return { status: `ACIDIC STRESS (pH ${zPh} < ${r[0]})`, caution: true, score: 8 };
-    if (zPh > r[1]) return { status: `ALKALINE CAUTION (pH ${zPh} > ${r[1]})`, caution: true, score: 10 };
-    return { status: 'OPTIMAL', caution: false, score: 25 };
+    if (ph < 5.0) return { status: 'Extreme Acidic', caution: true, score: 4 };
+    if (ph >= 5.0 && ph < 6.8) return { status: 'Acidic Stress', caution: true, score: 12 };
+    if (ph >= 6.8 && ph <= 7.3) return { status: 'Optimal', caution: false, score: 25 };
+    if (ph > 7.3 && ph <= 9.0) return { status: 'Alkaline Stress', caution: true, score: 12 };
+    return { status: 'Extreme Alkaline', caution: true, score: 4 };
   }
 
+  // 3. Temperature Profile
   if (type === 'temp') {
     const z = extractNumericRange(zVal);
     const r = extractNumericRange(rVal);
@@ -308,30 +313,32 @@ function evaluateStrictAgronomics(zVal, rVal, type, extraContext = {}) {
     const rMin = r[0];
     const rMax = r.length > 1 ? r[1] : r[0];
 
-    if (zMin < rMin) return { status: `COLD STRESS (Min ${zMin}°C < ${rMin}°C)`, caution: true, score: 5 };
-    if (zMax > rMax) return { status: `HEAT STRESS (Max ${zMax}°C > ${rMax}°C)`, caution: true, score: 5 };
-    return { status: 'OPTIMAL', caution: false, score: 20 };
+    if (zMax > rMax) return { status: 'Heat Stress', caution: true, score: 8 };
+    if (zMin < rMin) return { status: 'Cold Stress', caution: true, score: 8 };
+    return { status: 'Optimal', caution: false, score: 20 };
   }
 
+  // 4. Soil Type
   if (type === 'soil') {
     const zLow = zVal.toLowerCase();
     const rLow = rVal.toLowerCase();
 
-    if (zLow.includes('clay') && (rLow.includes('sand') || rLow.includes('sandy loam'))) {
-      return { status: 'DRAINAGE CAUTION (HEAVY CLAY)', caution: true, score: 4 };
+    // Sub Optimal if clay or sand mismatch
+    if (
+      (zLow.includes('clay') && (rLow.includes('sand') || rLow.includes('sandy loam'))) ||
+      (zLow.includes('sand') && (rLow.includes('clay') || rLow.includes('clay loam')))
+    ) {
+      return { status: 'Sub Optimal', caution: true, score: 6 };
     }
-    if (zLow.includes('sand') && (rLow.includes('clay') || rLow.includes('clay loam'))) {
-      return { status: 'PERCOLATION RISK (SANDY)', caution: true, score: 4 };
-    }
-    return { status: 'OPTIMAL', caution: false, score: 15 };
+    return { status: 'Optimal', caution: false, score: 15 };
   }
 
+  // 5. Soil Particle Ratio
   if (type === 'particles') {
     const zObj = extraContext.zoneParticles;
     const rObj = extraContext.reqParticles;
-
     if (!zObj || !rObj || zObj.sand === null || rObj.sand === null) {
-      return { status: 'OPTIMAL', caution: false, score: 15 };
+      return { status: 'Optimal', caution: false, score: 15 };
     }
 
     const diffSand = zObj.sand - rObj.sand;
@@ -339,49 +346,41 @@ function evaluateStrictAgronomics(zVal, rVal, type, extraContext = {}) {
     const diffClay = zObj.clay - rObj.clay;
     const TOLERANCE = 5.0;
 
-    const sandDev = Math.abs(diffSand) > TOLERANCE;
-    const siltDev = Math.abs(diffSilt) > TOLERANCE;
-    const clayDev = Math.abs(diffClay) > TOLERANCE;
-
-    if (!sandDev && !siltDev && !clayDev) {
-      return { status: 'OPTIMAL (WITHIN ±5% TOLERANCE)', caution: false, score: 15 };
+    // Fits perfect within 5% variation
+    if (Math.abs(diffSand) <= TOLERANCE && Math.abs(diffClay) <= TOLERANCE && Math.abs(diffSilt) <= TOLERANCE) {
+      return { status: 'Optimal', caution: false, score: 15 };
     }
 
-    const issues = [];
-    if (diffClay > TOLERANCE) issues.push(`CLAY EXCESS (+${diffClay}%)`);
-    else if (diffClay < -TOLERANCE) issues.push(`CLAY DEFICIT (${diffClay}%)`);
+    if (diffClay > TOLERANCE) return { status: 'Clay Excess', caution: true, score: 6 };
+    if (diffClay < -TOLERANCE) return { status: 'Clay Deficit', caution: true, score: 6 };
+    if (diffSand > TOLERANCE) return { status: 'High Sand', caution: true, score: 6 };
+    if (diffSand < -TOLERANCE) return { status: 'Low Sand', caution: true, score: 6 };
+    if (diffSilt > TOLERANCE) return { status: 'Silt Excess', caution: true, score: 8 };
+    if (diffSilt < -TOLERANCE) return { status: 'Silt Deficit', caution: true, score: 8 };
 
-    if (diffSand > TOLERANCE) issues.push(`HIGH SAND (+${diffSand}%)`);
-    else if (diffSand < -TOLERANCE) issues.push(`LOW SAND (${diffSand}%)`);
-
-    if (issues.length === 0 && siltDev) {
-      issues.push(`SILT VARIATION (${diffSilt > 0 ? '+' : ''}${diffSilt}%)`);
-    }
-
-    return {
-      status: `VARIATION > 5% (${issues.join(', ')})`,
-      caution: true,
-      score: Math.max(15 - Math.round((Math.abs(diffSand) + Math.abs(diffClay)) / 4), 3),
-    };
+    return { status: 'Sub Optimal', caution: true, score: 8 };
   }
 
   return { status: 'NA', caution: true, score: 0 };
 }
 
-// 4. Main Controller Endpoint
+// 3. Main Controller Endpoint
 export const getMatchScore = async (req, res) => {
   const reqStart = performance.now();
-  const { category, technology, country, recommendedStates, originRegion } = req.body;
+  const { category, technology, techType, variety, crop, cropType, country, recommendedStates, originRegion } = req.body;
 
   if (!country || !country.trim()) return res.status(400).json({ success: false, error: "'country' is required." });
-  if (!technology || !technology.trim()) return res.status(400).json({ success: false, error: "'technology' is required." });
 
   const targetCountry = country.trim();
-  const targetTech = technology.trim();
-  const targetCategory = (category || '').trim();
+  const targetTech = (technology || variety || techType || 'Commercial Agricultural Product').trim();
+  const targetCrop = (crop || cropType || targetTech).trim();
+  const targetCategory = (category || 'Seeds & Varieties').trim();
   const passedStates = recommendedStates || originRegion || null;
 
-  const dedupKey = `${targetCountry.toLowerCase()}_${targetTech.toLowerCase()}_${targetCategory.toLowerCase()}`;
+  // Resolve Category Sub-Engine
+  const { key, handler, label } = resolveMatchHandler(targetCategory, targetTech);
+
+  const dedupKey = `${targetCountry.toLowerCase()}_${targetTech.toLowerCase()}_${key}`;
 
   if (activeMatchRequests.has(dedupKey)) {
     try {
@@ -394,7 +393,8 @@ export const getMatchScore = async (req, res) => {
 
   const executionPromise = (async () => {
     console.log('\n' + '='.repeat(70));
-    console.log(`🌾 [MATCH ENGINE] Target: "${targetTech}" (${targetCategory || 'Seeds'}) -> 🌍 "${targetCountry}"`);
+    console.log(`🌾 [MATCH ENGINE] Target: "${targetTech}" (${label} via ${key}MatchEngine) -> 🌍 "${targetCountry}"`);
+    console.log(`🌱 Crop Context: "${targetCrop}"`);
     console.log('='.repeat(70));
 
     const [zoneRes, soilDbRes, climateDbRes] = await Promise.all([
@@ -409,18 +409,8 @@ export const getMatchScore = async (req, res) => {
 
     console.log(`📦 [DB READY] Found ${dbZones.length} Exact Zones for "${targetCountry}"`);
 
-    const soilMap = new Map(
-      (soilDbRes.data || []).map((s) => [
-        (s['Agroclimatic Zone'] || s.zone_name || '').toLowerCase().trim(),
-        s,
-      ])
-    );
-    const climateMap = new Map(
-      (climateDbRes.data || []).map((c) => [
-        (c['Zone Name'] || c.zone_name || '').toLowerCase().trim(),
-        c,
-      ])
-    );
+    const soilMap = new Map((soilDbRes.data || []).map((s) => [(s['Agroclimatic Zone'] || s.zone_name || '').toLowerCase().trim(), s]));
+    const climateMap = new Map((climateDbRes.data || []).map((c) => [(c['Zone Name'] || c.zone_name || '').toLowerCase().trim(), c]));
 
     let techRequirements = null;
 
@@ -432,26 +422,17 @@ export const getMatchScore = async (req, res) => {
       const { data: seedData } = await supabase
         .from('govt_crop_data')
         .select('*')
-        .eq('"Variety Name"', targetTech)
+        .or(`"Variety Name".ilike.%${targetTech}%,"Crop".ilike.%${targetCrop}%`)
         .limit(1);
-      if (seedData && seedData.length > 0 && seedData[0]['Recommended States']) {
-        techRequirements = await getAggregatedStatesProfile(seedData[0]['Recommended States']);
+
+      if (seedData && seedData.length > 0) {
+        const rawStates = seedData[0]['Recommended States'] || seedData[0]['recommended_states'];
+        techRequirements = await getAggregatedStatesProfile(rawStates);
       }
     }
 
     if (!techRequirements) {
-      techRequirements = {
-        source: 'NA',
-        rainfallStr: 'NA',
-        phStr: 'NA',
-        temperatureStr: '15°C – 35°C',
-        soilRequirement: 'NA',
-        particleRatioStr: 'NA',
-        particleValues: null,
-        rainfallRange: null,
-        phRange: null,
-        temperatureRange: null,
-      };
+      techRequirements = await inferAgronomicProfileWithGroq(targetCrop, targetTech);
     }
 
     const rawZonesPayload = dbZones.map((z, i) => {
@@ -467,30 +448,51 @@ export const getMatchScore = async (req, res) => {
       const zSilt = parseFloat(sRow?.['Silt Ratio (%)'] ?? 35);
       const zClay = parseFloat(sRow?.['Clay Ratio (%)'] ?? 25);
 
-      const particleStr = `Sand: ${Math.round(zSand)}% | Silt: ${Math.round(zSilt)}% | Clay: ${Math.round(zClay)}%`;
-      const soilTypeFull = wrbTaxonomy ? `${textureName} (${wrbTaxonomy})` : textureName;
-
       return {
         code: `ZONE-${i + 1}`,
         name: zName,
         rainfall: cRow?.['Baseline Rainfall'] || cRow?.baseline_rainfall || z.baseline_rainfall || 'NA',
-        soil_ph: sRow?.['pH Level (0-30cm)'] != null
-          ? `${sRow['pH Level (0-30cm)']}`
-          : sRow?.ph_level != null
-          ? `${sRow.ph_level}`
-          : z.soil_ph || 'NA',
-        soil_type: soilTypeFull,
+        soil_ph: sRow?.['pH Level (0-30cm)'] != null ? `${sRow['pH Level (0-30cm)']}` : sRow?.ph_level != null ? `${sRow.ph_level}` : z.soil_ph || 'NA',
+        soil_type: wrbTaxonomy ? `${textureName} (${wrbTaxonomy})` : textureName,
         temperature: cRow?.['Baseline Temperature'] || cRow?.baseline_temperature || z.baseline_temperature || '20°C – 30°C',
         crops: z.suitable_crops || 'NA',
-        particle_str: particleStr,
+        particle_str: `Sand: ${Math.round(zSand)}% | Silt: ${Math.round(zSilt)}% | Clay: ${Math.round(zClay)}%`,
         particle_values: { sand: Math.round(zSand), silt: Math.round(zSilt), clay: Math.round(zClay) },
       };
     });
 
-    const aiResult = await evaluateAllZonesWithOllama(targetTech, targetCountry, techRequirements, rawZonesPayload);
+    console.log(`\n   🤖 [GROQ AI ENGINE] Dispatched to: controllers/match/${key}MatchEngine.js`);
+    const timerStart = Date.now();
 
+    const rawAiResult = await handler({
+      technology: targetTech,
+      country: targetCountry,
+      techRequirements,
+      zonesList: rawZonesPayload
+    });
+
+    const duration = ((Date.now() - timerStart) / 1000).toFixed(2);
+    console.log(`   ✨ [GROQ INFERENCE FINISHED] Completed in ⏱️ ${duration}s!`);
+
+    const aiZonesList = Array.isArray(rawAiResult)
+      ? rawAiResult
+      : Array.isArray(rawAiResult?.zones)
+      ? rawAiResult.zones
+      : [];
+
+    // Map all zones: Index + Name Matching (eliminates AI: NA)
     const zonesData = rawZonesPayload.map((z, idx) => {
-      const aiZ = aiResult?.zones?.find((x) => x.zone_index === idx + 1) || aiResult?.zones?.[idx];
+      const currentIdx = idx + 1;
+      const cleanTargetName = z.name.toLowerCase().replace(/zone/g, '').trim();
+
+      const aiZ =
+        aiZonesList.find((x) => Number(x?.zone_index) === currentIdx) ||
+        aiZonesList.find((x) => {
+          const aiName = String(x?.zone_name || '').toLowerCase();
+          return aiName && (aiName.includes(cleanTargetName) || cleanTargetName.includes(aiName));
+        }) ||
+        aiZonesList[idx] ||
+        null;
 
       const rainEval = evaluateStrictAgronomics(z.rainfall, techRequirements.rainfallStr, 'rain');
       const phEval = evaluateStrictAgronomics(z.soil_ph, techRequirements.phStr, 'ph');
@@ -500,10 +502,7 @@ export const getMatchScore = async (req, res) => {
         z.particle_str,
         techRequirements.particleRatioStr,
         'particles',
-        {
-          zoneParticles: z.particle_values,
-          reqParticles: techRequirements.particleValues,
-        }
+        { zoneParticles: z.particle_values, reqParticles: techRequirements.particleValues }
       );
 
       const isDataMissing = z.rainfall === 'NA' || techRequirements.rainfallStr === 'NA';
@@ -514,127 +513,43 @@ export const getMatchScore = async (req, res) => {
       const soilCompat = aiZ?.soil_compatibility || soilEval.status;
       const particleCompat = aiZ?.particle_compatibility || particleEval.status;
 
-      const rainCaution = !rainCompat.toUpperCase().includes('OPTIMAL');
-      const phCaution = !phCompat.toUpperCase().includes('OPTIMAL');
-      const tempCaution = !tempCompat.toUpperCase().includes('OPTIMAL');
-      const soilCaution = !soilCompat.toUpperCase().includes('OPTIMAL');
-      const particleCaution = !particleCompat.toUpperCase().includes('OPTIMAL');
+      const mathScore = Math.min(
+        Math.max(rainEval.score + phEval.score + tempEval.score + soilEval.score + particleEval.score, 0),
+        100
+      );
 
-      // Detect All Non-Optimal Parameters
-      const nonOptimalIssues = [];
-
-      if (rainCaution) {
-        if (rainCompat.toUpperCase().includes('EXCESS')) {
-          nonOptimalIssues.push({
-            parameter: 'Rainfall',
-            mitigation: 'Construct raised planting beds and install secondary perimeter drainage furrows to prevent excess waterlogging.'
-          });
-        } else {
-          nonOptimalIssues.push({
-            parameter: 'Rainfall',
-            mitigation: 'Deploy drip/supplementary irrigation channels and apply straw mulching to conserve root-zone moisture.'
-          });
-        }
-      }
-
-      if (phCaution) {
-        if (phCompat.toUpperCase().includes('ACIDIC')) {
-          nonOptimalIssues.push({
-            parameter: 'Soil pH',
-            mitigation: 'Apply agricultural lime (calcium carbonate) or dolomite at 1.5–2.0 t/ha prior to sowing to neutralize subsoil acidity.'
-          });
-        } else {
-          nonOptimalIssues.push({
-            parameter: 'Soil pH',
-            mitigation: 'Apply agricultural gypsum or elemental sulfur amendments along with organic compost to lower alkaline pH stress.'
-          });
-        }
-      }
-
-      if (tempCaution) {
-        if (tempCompat.toUpperCase().includes('COLD')) {
-          nonOptimalIssues.push({
-            parameter: 'Temperature',
-            mitigation: 'Adjust planting window to warmer weeks or deploy low-tunnel plastic covers during early germination.'
-          });
-        } else {
-          nonOptimalIssues.push({
-            parameter: 'Temperature',
-            mitigation: 'Implement light overhead misting/sprinklers and maintain shade barriers during peak heat hours.'
-          });
-        }
-      }
-
-      if (soilCaution) {
-        nonOptimalIssues.push({
-          parameter: 'Soil Type (WRB)',
-          mitigation: 'Incorporate decomposed organic manure and biochar to improve soil aeration and internal structure.'
-        });
-      }
-
-      if (particleCaution) {
-        nonOptimalIssues.push({
-          parameter: 'Soil Particle Ratio',
-          mitigation: 'Apply targeted sand/silt/organic matter blending and practice minimum-tillage to stabilize soil texture balance.'
-        });
-      }
-
+      const aiScoreRaw = aiZ?.score !== undefined ? Number(aiZ.score) : NaN;
       const calculatedScore = isDataMissing
         ? 0
-        : aiZ?.score !== undefined
-        ? Number(aiZ.score)
-        : Math.min(
-            Math.max(
-              rainEval.score + phEval.score + tempEval.score + soilEval.score + particleEval.score,
-              0
-            ),
-            100
-          );
+        : !isNaN(aiScoreRaw) && aiScoreRaw > 0
+        ? aiScoreRaw
+        : mathScore > 0
+        ? mathScore
+        : 15;
 
-      const statusLabel =
-        isDataMissing || calculatedScore === 0
-          ? 'NA'
-          : calculatedScore >= 80
-          ? 'Excellent'
-          : calculatedScore >= 60
-          ? 'Good / Moderate'
-          : 'Caution Required';
+      console.log(`   [ZONE SCORE DEBUG] ${z.name} -> AI: ${aiZ?.score ?? 'NA'} | Math: ${mathScore}% | Final Applied: ${calculatedScore}%`);
 
-      const fallbackSummary = calculatedScore >= 80
-        ? `Optimal agro-climatic alignment in ${z.name} supports successful commercial deployment of ${targetTech}.`
-        : `Identified environmental stress in ${z.name} (${[rainCompat, phCompat, soilCompat, particleCompat].filter((c) => !c.toUpperCase().includes('OPTIMAL') && c !== 'NA').join(', ')}) requires agronomic adaptation.`;
+      // Overall Status per dictionary:
+      // > 85% -> Excellent (Emerald)
+      // 60-85% -> Moderate (Amber)
+      // < 60% -> Poor (Ruby)
+      const statusLabel = isDataMissing || calculatedScore === 0
+        ? 'NA'
+        : calculatedScore > 85
+        ? 'Excellent'
+        : calculatedScore >= 60
+        ? 'Moderate'
+        : 'Poor';
 
-      const summary = isDataMissing ? 'NA' : aiZ?.summary && aiZ.summary !== 'NA' ? aiZ.summary : fallbackSummary;
+      const summary = isDataMissing
+        ? 'NA'
+        : aiZ?.summary && typeof aiZ.summary === 'string' && aiZ.summary.trim().length > 15
+        ? aiZ.summary.trim()
+        : `Agro-climatic suitability analysis completed for ${z.name}.`;
 
-      // Dynamic Mitigation Formatting (Bullet points up to 3 max or Severe Alert if >3)
-      let calloutLabel = 'Optimal Agro-Ecological Fit';
-      let calloutTone = 'opportunity';
-      let mitigationList = [];
-
-      if (nonOptimalIssues.length === 0) {
-        calloutLabel = 'Optimal Agro-Ecological Fit';
-        calloutTone = 'opportunity';
-        mitigationList = ['Proceed with standard commercial sowing schedules and balanced fertilizer regimen.'];
-      } else if (nonOptimalIssues.length <= 3) {
-        calloutLabel = `Agronomic Mitigation Protocols (${nonOptimalIssues.length} Factor${nonOptimalIssues.length > 1 ? 's' : ''} Addressed)`;
-        calloutTone = 'caution';
-        
-        // Use AI generated mitigations if array provided; otherwise use dynamic fallback list
-        if (Array.isArray(aiZ?.mitigations) && aiZ.mitigations.length > 0) {
-          mitigationList = aiZ.mitigations.slice(0, 3);
-        } else {
-          mitigationList = nonOptimalIssues.slice(0, 3).map(item => `[${item.parameter}] ${item.mitigation}`);
-        }
-      } else {
-        // More than 3 non-optimal parameters (>3 Stress Factors)
-        calloutLabel = `High Ecological Barrier (${nonOptimalIssues.length} Non-Optimal Parameters Detected)`;
-        calloutTone = 'caution';
-        mitigationList = [
-          'Site Feasibility Warning: Multiple severe environmental divergences detected simultaneously (Rainfall, Soil Chemistry, Texture & Temperature).',
-          ...nonOptimalIssues.slice(0, 3).map(item => `[${item.parameter}] ${item.mitigation}`),
-          'Conduct comprehensive field pilot trials and high-cost infrastructure adaptation before commercial scale rollout.'
-        ];
-      }
+      const mitigations = Array.isArray(aiZ?.mitigations) && aiZ.mitigations.length > 0
+        ? aiZ.mitigations
+        : ['Proceed with standard agronomic field protocols.'];
 
       return {
         code: z.code,
@@ -647,23 +562,24 @@ export const getMatchScore = async (req, res) => {
         status_label: statusLabel,
         summary,
         table: [
-          { parameter: 'Annual Rainfall', zoneValue: z.rainfall, requirement: techRequirements.rainfallStr, compatibility: rainCompat, caution: rainCaution },
-          { parameter: 'Soil pH Range', zoneValue: z.soil_ph, requirement: techRequirements.phStr, compatibility: phCompat, caution: phCaution },
-          { parameter: 'Temperature Profile', zoneValue: z.temperature, requirement: techRequirements.temperatureStr, compatibility: tempCompat, caution: tempCaution },
-          { parameter: 'Soil Type (WRB)', zoneValue: z.soil_type, requirement: techRequirements.soilRequirement, compatibility: soilCompat, caution: soilCaution },
-          { parameter: 'Soil Particle Ratio (Sand|Silt|Clay)', zoneValue: z.particle_str, requirement: techRequirements.particleRatioStr, compatibility: particleCompat, caution: particleCaution },
+          { parameter: 'Annual Rainfall', zoneValue: z.rainfall, requirement: techRequirements.rainfallStr, compatibility: rainCompat, caution: !String(rainCompat).toUpperCase().includes('OPTIMAL') },
+          { parameter: 'Soil pH Range', zoneValue: z.soil_ph, requirement: techRequirements.phStr, compatibility: phCompat, caution: !String(phCompat).toUpperCase().includes('OPTIMAL') },
+          { parameter: 'Temperature Profile', zoneValue: z.temperature, requirement: techRequirements.temperatureStr, compatibility: tempCompat, caution: !String(tempCompat).toUpperCase().includes('OPTIMAL') },
+          { parameter: 'Soil Type (WRB)', zoneValue: z.soil_type, requirement: techRequirements.soilRequirement, compatibility: soilCompat, caution: !String(soilCompat).toUpperCase().includes('OPTIMAL') },
+          { parameter: 'Soil Particle Ratio (Sand|Silt|Clay)', zoneValue: z.particle_str, requirement: techRequirements.particleRatioStr, compatibility: particleCompat, caution: !String(particleCompat).toUpperCase().includes('OPTIMAL') },
         ],
         callouts: [
           {
-            tone: calloutTone,
-            label: calloutLabel,
-            text: mitigationList.length === 1 ? mitigationList[0] : mitigationList,
-            items: mitigationList, // Structured array for clean frontend bullet rendering
+            tone: calculatedScore > 85 ? 'opportunity' : 'caution',
+            label: calculatedScore > 85 ? 'Optimal Agro-Ecological Fit' : `Agronomic Mitigation Protocols (${mitigations.length} Factors Addressed)`,
+            text: mitigations.length === 1 ? mitigations[0] : mitigations,
+            items: mitigations,
           },
         ],
         notes: [
-          `Evaluation Engine: ${aiResult ? 'Ollama Agronomic Intelligence' : 'Direct Database Verification'}.`,
+          `Evaluation Engine: Groq LPU (${key}MatchEngine).`,
           `Requirement Baseline: ${techRequirements.source}.`,
+          ...(techRequirements.noticeTag ? [techRequirements.noticeTag] : []),
         ],
       };
     });
@@ -679,12 +595,23 @@ export const getMatchScore = async (req, res) => {
     return {
       success: true,
       country: targetCountry,
-      category: targetCategory,
+      category: label,
       technology: targetTech,
+      baseline_source: techRequirements.source,
+      is_ai_inferred: Boolean(techRequirements.isAiInferred),
+      notice_tag: techRequirements.noticeTag || null,
+      requirements_used: {
+        rainfall: techRequirements.rainfallStr,
+        temperature: techRequirements.temperatureStr,
+        soil_ph: techRequirements.phStr,
+        soil_type: techRequirements.soilRequirement,
+        particle_ratio: techRequirements.particleRatioStr
+      },
       executive_overview: {
         total_zones_analysed: zonesData.length,
         average_score: avgScore > 0 ? `${avgScore}% avg` : 'NA',
         best_zone: bestZone ? bestZone.name : 'NA',
+        notice_tag: techRequirements.noticeTag || null,
       },
       db_meta: { total_zones: zonesData.length, matching_source: techRequirements.source },
       intro: `Agroclimatic Match Report for ${targetTech} in ${targetCountry}.`,
@@ -696,7 +623,7 @@ export const getMatchScore = async (req, res) => {
         rainfall: z.rainfall,
         soil_ph: z.soil_ph,
         crops: z.districts,
-        priority: z.score >= 80 ? 'Priority 1 (Target Launch)' : z.score > 0 ? 'Priority 2 (Expansion)' : 'NA',
+        priority: z.score > 85 ? 'Priority 1 (Target Launch)' : z.score >= 60 ? 'Priority 2 (Expansion)' : 'Priority 3 (Caution)',
       })),
     };
   })();
@@ -713,3 +640,5 @@ export const getMatchScore = async (req, res) => {
     activeMatchRequests.delete(dedupKey);
   }
 };
+
+export const calculateMatchScore = getMatchScore;

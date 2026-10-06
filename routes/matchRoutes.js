@@ -1,14 +1,14 @@
-// agripath-backend/routes/matchRoutes.js
+// routes/matchRoutes.js
 import express from 'express';
-import { getMatchScore } from '../controllers/matchController.js';
-import { getBioMatchScore } from '../controllers/bioMatchController.js'; // <- Naya dedicated bio controller
+import { getMatchScore, calculateMatchScore } from '../controllers/matchController.js';
 
 const router = express.Router();
 
-// 1. Existing Crops & Seeds Route (Unchanged)
-router.post('/match-score', getMatchScore);
+// Unified multi-category match score endpoint (Seeds, Bio, Protection, Fertilizers, Machinery)
+router.post('/match-score', calculateMatchScore || getMatchScore);
+router.post('/', calculateMatchScore || getMatchScore);
 
-// 2. Dedicated Biological Inputs Route
-router.post('/bio-match-score', getBioMatchScore);
+// Backward compatibility: If any client calls bio-match-score
+router.post('/bio-match-score', calculateMatchScore || getMatchScore);
 
 export default router;
