@@ -45,13 +45,16 @@ app.use(
       ) {
         return callback(null, true);
       }
-      return callback(null, true); // Safe fallback
+      return callback(null, true);
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
   })
 );
+
+// Preflight CORS requests ko force allow karein (405 error fix)
+app.options('*', cors());
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -75,12 +78,19 @@ app.use('/api/regulatory', regulatoryRoutes);
 app.use('/api/regulatory-pathway', regulatoryRoutes);
 app.use('/api/bio-inputs', bioInputRoutes);
 app.use('/api/machinery', machineryRoutes);
+
+// Fertilizers: Support both plural and singular aliases
 app.use('/api/fertilizers', fertilizerRoutes);
+app.use('/api/fertilizer', fertilizerRoutes);
+
 app.use('/api/crop-protection', cropProtectionRoutes);
 
-// GTM Execution Routes
+// GTM Execution Routes (Support all frontend persona aliases)
 app.post('/api/gtm/generate-plan', generateDynamicGtmPlan);
 app.post('/api/gtm/plan', generateDynamicGtmPlan);
+app.post('/api/gtm', generateDynamicGtmPlan);
+app.post('/api/business/gtm', generateDynamicGtmPlan);
+app.post('/api/farmer/gtm', generateDynamicGtmPlan);
 
 // Error Middlewares
 app.use(notFound);
