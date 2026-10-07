@@ -9,10 +9,10 @@
     "seed": "node seed.js"
   },
   "dependencies": {
-<<<<<<< HEAD
-=======
+
+
     "@google/genai": "^2.22.0",
->>>>>>> 478af94 (Deploy AgriPath Backend to Render)
+
     "@supabase/supabase-js": "^2.43.0",
     "axios": "^1.19.0",
     "chalk": "^6.0.0",
@@ -21,10 +21,7 @@
     "csv-parser": "^3.2.1",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-<<<<<<< HEAD
-=======
     "groq-sdk": "^1.6.0",
->>>>>>> 478af94 (Deploy AgriPath Backend to Render)
     "ollama": "^0.5.0",
     "xlsx": "^0.18.5"
   },
