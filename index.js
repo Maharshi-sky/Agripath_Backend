@@ -22,31 +22,35 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
 
-// Permissive CORS for Local Development & Vercel
+// Permissive CORS for Local Development, Vercel & AWS Custom Domain
 const allowedOrigins = [
   process.env.CLIENT_URL,
   'http://localhost:5175',
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://localhost:3000',
   'http://127.0.0.1:5175',
   'http://127.0.0.1:5173',
-  'http://localhost:3000',
+  'https://agripass-two.vercel.app'
 ].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, callback) => {
+      // Allow non-browser requests or server-to-server calls
       if (!origin) return callback(null, true);
+      
       if (
         allowedOrigins.includes(origin) ||
         origin.includes('localhost') ||
         origin.includes('127.0.0.1') ||
         origin.includes('devtunnels.ms') ||
-        origin.includes('vercel.app')
+        origin.includes('vercel.app') ||
+        (process.env.ALLOWED_DOMAIN && origin.includes(process.env.ALLOWED_DOMAIN))
       ) {
         return callback(null, true);
       }
-      return callback(null, true);
+      return callback(null, true); // Fallback allow for smooth demo/staging
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -54,23 +58,28 @@ app.use(
   })
 );
 
-// Preflight CORS requests ko force allow karein (405 error fix)
+// Preflight CORS requests ko force allow karein (405 / preflight error fix)
 app.options('*', cors());
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
+// 1. Root & Health Check Endpoints (Fixes root 404 on Render direct visits)
+const healthHandler = (req, res) => {
   res.status(200).json({
     status: 'online',
+    service: 'AgriPath Backend API Engine',
     engine: 'Groq LPU Acceleration',
     timestamp: new Date().toISOString(),
-    service: 'AgriPath Backend API',
+    env: process.env.NODE_ENV || 'production'
   });
-});
+};
 
-// API Routes
+app.get('/', healthHandler);
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
+
+// 2. Core API Routes
 app.use('/api/crops', cropRoutes);
 app.use('/api', matchRoutes);
 app.use('/api/recommendations', recommendationRoutes);
